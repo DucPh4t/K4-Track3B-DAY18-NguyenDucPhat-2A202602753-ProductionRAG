@@ -11,6 +11,7 @@ Test: pytest tests/test_m1.py
 
 import os, sys, glob, re
 from dataclasses import dataclass, field
+import numpy as np
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -65,7 +66,7 @@ def load_documents(data_dir: str = DATA_DIR) -> list[dict]:
 
 def chunk_basic(text: str, chunk_size: int = 500, metadata: dict | None = None) -> list[Chunk]:
     """
-    Basic chunking: split theo paragraph (\\n\\n).
+    Basic chunking: split theo paragraph (\n\n).
     Đây là baseline — KHÔNG phải mục tiêu của module này.
     (Đã implement sẵn)
     """
@@ -85,6 +86,16 @@ def chunk_basic(text: str, chunk_size: int = 500, metadata: dict | None = None) 
 
 # ─── Strategy 1: Semantic Chunking ───────────────────────
 
+_SEMANTIC_MODEL = None
+
+
+def _get_semantic_model():
+    global _SEMANTIC_MODEL
+    if _SEMANTIC_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+        _SEMANTIC_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+    return _SEMANTIC_MODEL
+
 
 def chunk_semantic(text: str, threshold: float = SEMANTIC_THRESHOLD,
                    metadata: dict | None = None) -> list[Chunk]:
@@ -92,20 +103,37 @@ def chunk_semantic(text: str, threshold: float = SEMANTIC_THRESHOLD,
     Split text by sentence similarity — nhóm câu cùng chủ đề.
     Tốt hơn basic vì không cắt giữa ý.
     """
-    # TODO: Implement semantic chunking
-    # 1. from sentence_transformers import SentenceTransformer
-    #    from numpy import dot
-    #    from numpy.linalg import norm
-    # 2. metadata = metadata or {}
-    # 3. Split text thành sentences: re.split(r'(?<=[.!?])\s+|\n\n', text)
-    # 4. model = SentenceTransformer("all-MiniLM-L6-v2")
-    #    embeddings = model.encode(sentences)
-    # 5. cosine_sim(a, b) = dot(a, b) / (norm(a) * norm(b) + 1e-9)
-    # 6. Duyệt từ sentence[1]:
-    #      - sim(embedding[i-1], embedding[i]) < threshold → tách chunk mới
-    #      - else: gộp vào chunk hiện tại
-    # 7. Return [Chunk(text=joined_group, metadata={..., "strategy": "semantic"})]
-    return []
+    metadata = metadata or {}
+    raw_sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+|\n\n+', text) if s.strip()]
+    if not raw_sentences:
+        return []
+    if len(raw_sentences) == 1:
+        return [Chunk(text=raw_sentences[0], metadata={**metadata, "strategy": "semantic"})]
+
+    model = _get_semantic_model()
+    embeddings = model.encode(raw_sentences)
+
+    groups: list[list[str]] = [[raw_sentences[0]]]
+    for i in range(1, len(raw_sentences)):
+        prev_emb = embeddings[i - 1]
+        curr_emb = embeddings[i]
+        denom = (np.linalg.norm(prev_emb) * np.linalg.norm(curr_emb)) + 1e-9
+        sim = float(np.dot(prev_emb, curr_emb) / denom)
+
+        if sim < threshold:
+            groups.append([raw_sentences[i]])
+        else:
+            groups[-1].append(raw_sentences[i])
+
+    chunks = []
+    for idx, grp in enumerate(groups):
+        joined = " ".join(grp).strip()
+        if joined:
+            chunks.append(Chunk(
+                text=joined,
+                metadata={**metadata, "chunk_index": idx, "strategy": "semantic"}
+            ))
+    return chunks
 
 
 # ─── Strategy 2: Hierarchical Chunking ──────────────────
@@ -121,16 +149,61 @@ def chunk_hierarchical(text: str, parent_size: int = HIERARCHICAL_PARENT_SIZE,
     Returns:
         (parents, children) — mỗi child có parent_id link đến parent.
     """
-    # TODO: Implement hierarchical chunking
-    # 1. metadata = metadata or {}
-    # 2. Split text bằng "\n\n" → paragraphs
-    # 3. Gộp paragraphs thành parent chunks (mỗi parent ≤ parent_size chars):
-    #      pid = f"parent_{len(parents)}"
-    #      parents.append(Chunk(text=..., metadata={..., "chunk_type": "parent", "parent_id": pid}))
-    # 4. Mỗi parent → split thành children (mỗi child ≤ child_size chars):
-    #      children.append(Chunk(text=..., metadata={..., "chunk_type": "child"}, parent_id=pid))
-    # 5. return (parents, children)
-    return ([], [])
+    metadata = metadata or {}
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        paragraphs = [text.strip()] if text.strip() else []
+
+    parents: list[Chunk] = []
+    children: list[Chunk] = []
+
+    # 1. Build parent chunks
+    curr_parent_text = ""
+    parent_texts: list[str] = []
+    for para in paragraphs:
+        if curr_parent_text and (len(curr_parent_text) + len(para) + 2 > parent_size):
+            parent_texts.append(curr_parent_text.strip())
+            curr_parent_text = para
+        else:
+            curr_parent_text = f"{curr_parent_text}\n\n{para}".strip()
+    if curr_parent_text.strip():
+        parent_texts.append(curr_parent_text.strip())
+
+    # 2. For each parent, create children
+    for p_idx, p_str in enumerate(parent_texts):
+        pid = f"parent_{p_idx}"
+        parents.append(Chunk(
+            text=p_str,
+            metadata={**metadata, "chunk_type": "parent", "parent_id": pid},
+            parent_id=pid
+        ))
+
+        # Split parent text into small sentences / chunks for children
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+|\n+', p_str) if s.strip()]
+        if not sentences:
+            sentences = [p_str]
+
+        curr_child = ""
+        c_count = 0
+        for s in sentences:
+            if curr_child and (len(curr_child) + len(s) + 1 > child_size):
+                children.append(Chunk(
+                    text=curr_child.strip(),
+                    metadata={**metadata, "chunk_type": "child", "parent_id": pid, "child_index": c_count},
+                    parent_id=pid
+                ))
+                c_count += 1
+                curr_child = s
+            else:
+                curr_child = f"{curr_child} {s}".strip()
+        if curr_child.strip():
+            children.append(Chunk(
+                text=curr_child.strip(),
+                metadata={**metadata, "chunk_type": "child", "parent_id": pid, "child_index": c_count},
+                parent_id=pid
+            ))
+
+    return parents, children
 
 
 # ─── Strategy 3: Structure-Aware Chunking ────────────────
@@ -141,14 +214,43 @@ def chunk_structure_aware(text: str, metadata: dict | None = None) -> list[Chunk
     Parse markdown headers → chunk theo logical structure.
     Giữ nguyên tables, code blocks, lists — không cắt giữa chừng.
     """
-    # TODO: Implement structure-aware chunking
-    # 1. metadata = metadata or {}
-    # 2. sections = re.split(r'(^#{1,3}\s+.+$)', text, flags=re.MULTILINE)
-    # 3. Duyệt sections:
-    #      - Nếu match header (^#{1,3}\s+): lưu header hiện tại, tạo chunk cho content trước đó
-    #      - Else: gộp vào content hiện tại
-    # 4. Return [Chunk(text=header+content, metadata={..., "section": header, "strategy": "structure"})]
-    return []
+    metadata = metadata or {}
+    sections = re.split(r'(^#{1,3}\s+.+$)', text, flags=re.MULTILINE)
+
+    chunks: list[Chunk] = []
+    current_header = ""
+    current_body: list[str] = []
+
+    for part in sections:
+        part_clean = part.strip()
+        if not part_clean:
+            continue
+        if re.match(r'^#{1,3}\s+', part_clean):
+            if current_body or current_header:
+                body_str = "\n\n".join(current_body).strip()
+                full_text = f"{current_header}\n\n{body_str}".strip() if current_header else body_str
+                if full_text:
+                    section_name = current_header.lstrip('#').strip() if current_header else "general"
+                    chunks.append(Chunk(
+                        text=full_text,
+                        metadata={**metadata, "section": section_name, "strategy": "structure"}
+                    ))
+            current_header = part_clean
+            current_body = []
+        else:
+            current_body.append(part_clean)
+
+    if current_body or current_header:
+        body_str = "\n\n".join(current_body).strip()
+        full_text = f"{current_header}\n\n{body_str}".strip() if current_header else body_str
+        if full_text:
+            section_name = current_header.lstrip('#').strip() if current_header else "general"
+            chunks.append(Chunk(
+                text=full_text,
+                metadata={**metadata, "section": section_name, "strategy": "structure"}
+            ))
+
+    return chunks
 
 
 # ─── A/B Test: Compare All Strategies ────────────────────
